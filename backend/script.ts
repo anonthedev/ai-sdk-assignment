@@ -2,325 +2,370 @@ import "dotenv/config";
 import { GoogleGenAI } from "@google/genai";
 import { Agent, handoff, run, tool } from "@openai/agents";
 import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
 import { createWriteStream } from "fs";
-import { Readable } from "stream";
 import { exec } from "child_process";
 import { promisify } from "util";
-import fs from "fs/promises";
 
-const log = {
-  info: (msg: string, data?: any) => {
-    console.log(`[INFO] ${msg}`, data ? data : "");
-    return { type: "info", message: msg, data };
-  },
-  error: (msg: string, error?: any) => {
-    console.error(`[ERROR] ${msg}`, error ? error : "");
-    return { type: "error", message: msg, data: error };
-  },
-  warn: (msg: string, data?: any) => {
-    console.warn(`[WARN] ${msg}`, data ? data : "");
-    return { type: "warn", message: msg, data };
-  },
-  debug: (msg: string, data?: any) => {
-    console.debug(`[DEBUG] ${msg}`, data ? data : "");
-    return { type: "debug", message: msg, data };
-  },
-};
-
-const execAsync = promisify(exec);
 const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const execAsync = promisify(exec);
 
 type VideoStyle = "hype" | "ad" | "cinematic";
 
-const styleConfigs = {
-  hype: {
-    narrationPrompt: (prompt: string) => `Write a high-energy hype script with action verbs and excitement for: ${prompt}`,
-    visualPrompt: (prompt: string) => `Energetic visuals for: ${prompt}, with bold colors and motion.`
-  },
-  ad: {
-    narrationPrompt: (prompt: string) => `Write a professional, product-focused ad script for: ${prompt}`,
-    visualPrompt: (prompt: string) => `Clean, commercial visuals for: ${prompt}`
-  },
-  cinematic: {
-    narrationPrompt: (prompt: string) => `Write a poetic cinematic script (3-5 short lines) about: ${prompt}`,
-    visualPrompt: (prompt: string) => `Moody, dramatic film-style visuals for: ${prompt}`
-  }
-};
+// Create temp directory if it doesn't exist
+const TEMP_DIR = "/tmp";
 
-async function generateVideo(prompt: string, style: VideoStyle): Promise<{videoPath: string, imagePath: string}> {
-  const config = styleConfigs[style];
-  log.info(`Starting video generation for style: ${style}`);
+async function ensureTempDir() {
+  try {
+    await fs.access(TEMP_DIR);
+  } catch {
+    await fs.mkdir(TEMP_DIR, { recursive: true });
+    console.log(`Created temp directory: ${TEMP_DIR}`);
+  }
+}
+
+// Download video from URI and save to file
+async function downloadVideo(uri: string, filename: string): Promise<string> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const urlWithKey = `${uri}&key=${apiKey}`;
+
+  console.log(`Downloading video from: ${uri}`);
+
+  const response = await fetch(urlWithKey);
+  if (!response.ok) {
+    throw new Error(`Failed to download video: ${response.statusText}`);
+  }
+
+  const filePath = path.join(TEMP_DIR, filename);
+  const fileStream = createWriteStream(filePath);
+
+  if (!response.body) {
+    throw new Error("No response body");
+  }
+
+  const reader = response.body.getReader();
 
   try {
-    log.info("Generating narration with Gemini");
-    const narrationRes = await genAI.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [config.narrationPrompt(prompt)],
-    });
-
-    const narration = narrationRes.text?.replace(/\*/g, "").trim();
-    log.debug("Generated narration", { narration });
-
-    if (!narration) {
-      log.error("Failed to generate narration text");
-      throw new Error("Failed to generate narration text");
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      fileStream.write(value);
     }
+  } finally {
+    fileStream.end();
+  }
 
-    log.info("Generating image with Imagen");
-    const imageResp = await genAI.models.generateImages({
-      model: "imagen-3.0-generate-002",
-      prompt: config.visualPrompt(prompt),
-      config: { numberOfImages: 1 },
-    });
-    log.debug("Image generation response received");
+  console.log(`Video saved to: ${filePath}`);
+  return filePath;
+}
 
-    const image = imageResp.generatedImages?.[0]?.image;
-    if (!image?.imageBytes) {
-      log.error("Failed to generate image - no imageBytes in response");
-      throw new Error("❌ Failed to generate image.");
-    }
-    log.info("Image generated successfully");
+async function generateVideo({
+  prompt,
+  style,
+  narrationPrompt,
+  visualPrompt,
+}: {
+  prompt: string;
+  style: VideoStyle;
+  narrationPrompt: string;
+  visualPrompt: string;
+}): Promise<{ videoPath: string; imagePath: string }> {
+  console.log(
+    `[${style.toUpperCase()}] Starting video generation for prompt: ${prompt}`
+  );
 
-    const imagePath = `/tmp/${style}_image_${Date.now()}.png`;
-    log.info("Saving image to temporary file", { path: imagePath });
-    const imageBuffer = Buffer.from(image.imageBytes, 'base64');
-    await fs.writeFile(imagePath, imageBuffer);
-    log.debug("Image saved successfully", { path: imagePath });
+  // Ensure temp directory exists
+  await ensureTempDir();
 
-    log.info("Starting video generation with Veo");
-    let op = await genAI.models.generateVideos({
-      model: "veo-2.0-generate-001",
-      prompt: narration,
-      image: {
-        imageBytes: image.imageBytes,
-        mimeType: "image/png",
-      },
-      config: {
-        aspectRatio: "9:16",
-        numberOfVideos: 2,
-      },
-    });
-    log.debug("Initial video operation response", {
-      operationName: op.name,
-      done: op.done,
-    });
+  console.log(`[${style.toUpperCase()}] Generating narration...`);
+  const narrationRes = await genAI.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [narrationPrompt],
+  });
 
-    let pollCount = 0;
-    while (!op.done) {
-      pollCount++;
-      log.info(`⏳ Generating Veo video... (poll #${pollCount})`);
-      await new Promise((r) => setTimeout(r, 10000));
-      op = await genAI.operations.getVideosOperation({ operation: op });
-      log.debug(`Poll #${pollCount} result`, { done: op.done });
-    }
+  const narration = narrationRes.text?.replace(/\*/g, "").trim();
+  if (!narration) {
+    console.error(`[${style.toUpperCase()}] Failed to generate narration text`);
+    throw new Error("Failed to generate narration text");
+  }
+  console.log(
+    `[${style.toUpperCase()}] Narration generated: ${narration.substring(
+      0,
+      100
+    )}...`
+  );
 
-    const videos = op.response?.generatedVideos;
-    log.debug("Video generation complete", {
-      videoCount: videos?.length,
-      operationName: op.name,
-      hasResponse: !!op.response,
-      responseKeys: op.response ? Object.keys(op.response) : [],
-      error: op.error,
-      metadata: op.metadata
-    });
+  console.log(`[${style.toUpperCase()}] Generating image...`);
+  const imageResp = await genAI.models.generateImages({
+    model: "imagen-3.0-generate-002",
+    prompt: visualPrompt,
+    config: { numberOfImages: 1 },
+  });
 
-    if (!videos || videos.length === 0) {
-      const errorMsg = "Video generation failed: The API did not return any video data";
-      log.error(errorMsg, { 
-        apiError: op.error,
-        response: op.response
-      });
-      throw new Error(errorMsg);
-    }
+  const image = imageResp.generatedImages?.[0]?.image;
+  if (!image?.imageBytes) {
+    console.error(`[${style.toUpperCase()}] Failed to generate image`);
+    throw new Error("Failed to generate image");
+  }
+  console.log(`[${style.toUpperCase()}] Image generated successfully`);
 
-    const paths: string[] = [];
-    log.info("Starting video downloads", { requested: 2, found: videos.length });
-    
-    const videoCount = Math.min(videos.length, 2);
-    for (let i = 0; i < videoCount; i++) {
+  // Save image to file
+  const imagePath = path.join(TEMP_DIR, `${style}_image_${Date.now()}.png`);
+  const imageBuffer = Buffer.from(image.imageBytes, "base64");
+  await fs.writeFile(imagePath, imageBuffer);
+  console.log(`[${style.toUpperCase()}] Image saved to: ${imagePath}`);
+
+  console.log(`[${style.toUpperCase()}] Starting video generation with Veo...`);
+  let op = await genAI.models.generateVideos({
+    model: "veo-2.0-generate-001",
+    prompt: narration,
+    image: {
+      imageBytes: image.imageBytes,
+      mimeType: "image/png",
+    },
+    config: {
+      aspectRatio: "9:16",
+      numberOfVideos: 2,
+    },
+  });
+
+  let pollCount = 0;
+  while (!op.done) {
+    pollCount++;
+    console.log(
+      `[${style.toUpperCase()}] Waiting for video generation... (poll #${pollCount})`
+    );
+    await new Promise((r) => setTimeout(r, 10000));
+    op = await genAI.operations.getVideosOperation({ operation: op });
+  }
+
+  const videos = op.response?.generatedVideos;
+  if (!videos || videos.length === 0) {
+    console.error(
+      `[${style.toUpperCase()}] Video generation failed - no videos returned`
+    );
+    throw new Error("Video generation failed");
+  }
+
+  // Download and save videos
+  const filePaths: string[] = [];
+  for (let i = 0; i < videos.length; i++) {
+    const uri = videos[i]?.video?.uri;
+    if (uri) {
+      console.log(
+        `[${style.toUpperCase()}] Video ${i + 1} URI generated: ${uri}`
+      );
+
+      // Generate filename with timestamp and style
+      const timestamp = Date.now();
+      const filename = `${style}_video_${timestamp}_${i + 1}.mp4`;
+
       try {
-        log.debug(`Downloading video ${i + 1}/${videoCount}`);
-        const uri = videos[i]?.video?.uri;
-
-        if (!uri) {
-          log.error(`No URI found for video ${i + 1}`);
-          continue;
-        }
-
-        log.debug(`Fetching video from URI: ${uri.substring(0, 30)}...`);
-        const res = await fetch(`${uri}&key=${process.env.GEMINI_API_KEY}`);
-
-        if (!res.ok) {
-          log.error(`Failed to fetch video ${i + 1}`, { status: res.status });
-          continue;
-        }
-
-        const outPath = `/tmp/${style}_${Date.now()}_${i}.mp4`;
-        log.debug(`Writing video ${i + 1} to: ${outPath}`);
-
-        const writer = createWriteStream(outPath);
-        Readable.fromWeb(res.body as any).pipe(writer);
-
-        await new Promise<void>((res, rej) => {
-          writer.on("finish", () => {
-            log.debug(`Video ${i + 1} written successfully`);
-            res();
-          });
-          writer.on("error", (err) => {
-            log.error(`Error writing video ${i + 1}`, err);
-            rej(err);
-          });
-        });
-
-        paths.push(outPath);
-      } catch (err) {
-        log.error(`Error processing video ${i + 1}`, err);
+        const filePath = await downloadVideo(uri, filename);
+        filePaths.push(filePath);
+        console.log(
+          `[${style.toUpperCase()}] Video ${i + 1} saved to: ${filePath}`
+        );
+      } catch (error) {
+        console.error(
+          `[${style.toUpperCase()}] Failed to download video ${i + 1}:`,
+          error
+        );
+        // Continue with other videos even if one fails
       }
     }
-
-    if (paths.length === 0) {
-      log.warn("Video download failed for all clips.");
-      throw new Error("Video download failed for all clips.");
-    }
-
-    if (paths.length === 1) {
-      log.info("Only one video was downloaded successfully, skipping concatenation");
-      return { videoPath: paths[0], imagePath };
-    }
-
-    log.info("Creating concat list for", { videoCount: paths.length });
-    const listPath = `/tmp/${style}_concat_list.txt`;
-    const listContent = paths.map((p) => `file '${p}'`).join("\n");
-    await fs.writeFile(listPath, listContent);
-    log.debug("Created concat list", { path: listPath, content: listContent });
-
-    const finalPath = `/tmp/${style}_final_${Date.now()}.mp4`;
-    log.info("Running ffmpeg to concatenate videos", {
-      command: `ffmpeg -f concat -safe 0 -i ${listPath} -c copy ${finalPath}`,
-    });
-
-    const { stdout, stderr } = await execAsync(
-      `ffmpeg -f concat -safe 0 -i ${listPath} -c copy ${finalPath}`
-    );
-    log.debug("ffmpeg output", { stdout, stderr });
-
-    log.info("Video generation complete", { finalPath, imagePath });
-    return { videoPath: finalPath, imagePath };
-  } catch (error) {
-    log.error(`Error in generateVideo for style ${style}`, error);
-    throw error;
   }
+
+  if (filePaths.length === 0) {
+    throw new Error("Failed to download any videos");
+  }
+
+  let finalVideoPath: string;
+
+  if (filePaths.length === 1) {
+    console.log(
+      `[${style.toUpperCase()}] Only one video downloaded, using as final output`
+    );
+    finalVideoPath = filePaths[0];
+  } else {
+    console.log(
+      `[${style.toUpperCase()}] Concatenating ${filePaths.length} videos...`
+    );
+
+    // Create concat list file
+    const listPath = path.join(TEMP_DIR, `${style}_concat_list.txt`);
+    const listContent = filePaths.map((p) => `file '${p}'`).join("\n");
+    await fs.writeFile(listPath, listContent);
+
+    // Concatenate videos using ffmpeg
+    finalVideoPath = path.join(TEMP_DIR, `${style}_final_${Date.now()}.mp4`);
+    const { stdout, stderr } = await execAsync(
+      `ffmpeg -f concat -safe 0 -i ${listPath} -c copy ${finalVideoPath}`
+    );
+
+    console.log(
+      `[${style.toUpperCase()}] Videos concatenated successfully: ${finalVideoPath}`
+    );
+  }
+
+  console.log(
+    `[${style.toUpperCase()}] Video generation complete - saved to ${finalVideoPath}`
+  );
+  return { videoPath: finalVideoPath, imagePath };
 }
 
 const PromptSchema = z.object({ prompt: z.string() });
 
-const createVideoTool = (style: VideoStyle) => tool({
-  name: `generate_${style}_video`,
-  description: `Generate a ${style} video from a user prompt.`,
-  parameters: PromptSchema,
-  execute: async ({ prompt }) => {
-    log.info(`${style} video tool called with prompt`, { prompt });
-    try {
-      const result = await generateVideo(prompt, style);
-      log.info(`${style} video generated successfully`, result);
-      return result;
-    } catch (error) {
-      log.error(`Error generating ${style} video`, error);
-      throw error;
-    }
-  },
-});
+const createHypeAgent = () =>
+  new Agent<{ prompt: string }>({
+    name: "Hype Video Agent",
+    instructions:
+      "You create fast-paced, high-energy hype videos that get people pumped up. Use bold visuals and powerful, energetic narration.",
+    tools: [
+      tool({
+        name: "generate_hype_video",
+        description:
+          "Generate a fast-paced, high-energy hype video from a user prompt.",
+        parameters: PromptSchema,
+        execute: async ({ prompt }) => {
+          console.log(`[HYPE] Starting hype video generation for: ${prompt}`);
+          return await generateVideo({
+            prompt,
+            style: "hype",
+            narrationPrompt: `Create a high-octane, adrenaline-pumping voiceover script for: ${prompt}. Use short sentences, punchy verbs, and crowd-rallying phrases.`,
+            visualPrompt: `Design energetic, flashy visuals with quick cuts, bold typography, vibrant motion graphics, and fast transitions — all themed around: ${prompt}`,
+          });
+        },
+      }),
+    ],
+  });
 
-const HypeAgent = new Agent({
-  name: "Hype Video Agent",
-  instructions: "You create fast-paced, high-energy hype videos using your tools.",
-  tools: [createVideoTool("hype")],
-});
+const createAdAgent = () =>
+  new Agent<{ prompt: string }>({
+    name: "Ad Video Agent",
+    instructions:
+      "You create professional, sleek promotional videos that highlight products, services, or ideas in a clean and marketable way.",
+    tools: [
+      tool({
+        name: "generate_ad_video",
+        description: "Generate a clean and polished promotional ad video.",
+        parameters: PromptSchema,
+        execute: async ({ prompt }) => {
+          console.log(`[AD] Starting ad video generation for: ${prompt}`);
+          return await generateVideo({
+            prompt,
+            style: "ad",
+            narrationPrompt: `Write a clear, persuasive product ad script for: ${prompt}. Focus on key features, benefits, and a strong call to action. Keep it brand-friendly and concise.`,
+            visualPrompt: `Sleek, minimal commercial visuals for: ${prompt}. Use clean lighting, product showcases, soft motion effects, and whitespace.`,
+          });
+        },
+      }),
+    ],
+  });
 
-const AdAgent = new Agent({
-  name: "Ad Video Agent", 
-  instructions: "You create clean and polished promotional ad videos using your tools.",
-  tools: [createVideoTool("ad")],
-});
+const createCinematicAgent = () =>
+  new Agent<{ prompt: string }>({
+    name: "Cinematic Video Agent",
+    instructions:
+      "You create emotional, story-driven cinematic videos with a poetic tone and visually rich atmosphere.",
+    tools: [
+      tool({
+        name: "generate_cinematic_video",
+        description: "Generate a visually rich, emotional cinematic video.",
+        parameters: PromptSchema,
+        execute: async ({ prompt }) => {
+          console.log(
+            `[CINEMATIC] Starting cinematic video generation for: ${prompt}`
+          );
+          return await generateVideo({
+            prompt,
+            style: "cinematic",
+            narrationPrompt: `Craft a poetic, emotionally resonant script (3–5 lines) that captures the essence of: ${prompt}. Use metaphors, vivid imagery, and a soft, reflective tone.`,
+            visualPrompt: `Create visually cinematic, atmospheric visuals for: ${prompt}. Use slow motion, natural lighting, deep contrast, and wide shots to evoke emotion.`,
+          });
+        },
+      }),
+    ],
+  });
 
-const CinematicAgent = new Agent({
-  name: "Cinematic Video Agent",
-  instructions: "You create emotional, cinematic-style storytelling videos using your tools.",
-  tools: [createVideoTool("cinematic")],
-});
+const createTriageAgent = () => {
+  const HypeAgent = createHypeAgent();
+  const AdAgent = createAdAgent();
+  const CinematicAgent = createCinematicAgent();
 
-const TriageAgent = new Agent({
-  name: "Triage Agent",
-  instructions: `You are a video director assistant.
+  return new Agent({
+    name: "Triage Agent",
+    instructions: `
+You are a video director assistant.
 Based on the user's input prompt, decide the best style and hand off:
-- Hype for excitement, energy, action
-- Ad for product promotions, marketing
-- Cinematic for emotional stories, dramatic content`,
-  handoffs: [
-    handoff(HypeAgent, {
-      toolNameOverride: "use_hype_tool",
-      toolDescriptionOverride: "Send to hype video agent for high-energy content.",
-    }),
-    handoff(AdAgent, {
-      toolNameOverride: "use_ad_tool", 
-      toolDescriptionOverride: "Send to ad video agent for promotional content.",
-    }),
-    handoff(CinematicAgent, {
-      toolNameOverride: "use_cinematic_tool",
-      toolDescriptionOverride: "Send to cinematic video agent for emotional storytelling.",
-    }),
-  ],
-});
+- Hype for excitement
+- Ad for product promotions
+- Cinematic for emotional stories`,
+    handoffs: [
+      handoff(HypeAgent, {
+        toolNameOverride: "use_hype_tool",
+        toolDescriptionOverride: "Send to hype video agent.",
+      }),
+      handoff(AdAgent, {
+        toolNameOverride: "use_ad_tool",
+        toolDescriptionOverride: "Send to ad video agent.",
+      }),
+      handoff(CinematicAgent, {
+        toolNameOverride: "use_cinematic_tool",
+        toolDescriptionOverride: "Send to cinematic video agent.",
+      }),
+    ],
+  });
+};
 
 async function main() {
   if (!process.argv[2]) {
     console.error("Please provide a prompt as a command line argument");
-    console.error("Example: node script.js 'my video prompt'");
+    console.error("Example: npm run script 'my video prompt'");
     process.exit(1);
   }
 
   const prompt = process.argv[2];
-  log.info("Starting video generation process", { prompt });
-  
-  try {
-    log.debug("Environment check", {
-      geminiKeyExists: !!process.env.GEMINI_API_KEY,
-    });
+  console.log(`[SCRIPT] Starting video generation for prompt: ${prompt}`);
 
-    log.debug("Running triage agent with prompt");
+  try {
+    console.log("[SCRIPT] Initializing triage agent...");
+    const TriageAgent = createTriageAgent();
+
+    console.log("[SCRIPT] Running agent with prompt...");
     const result = await run(TriageAgent, prompt);
-    log.debug("Triage agent run complete, awaiting final output");
-    
     const output = await result.finalOutput;
+
     if (!output) {
-      log.error("No output received from agent");
+      console.error("[SCRIPT] No output received from agent");
       throw new Error("No output received from agent");
     }
-    
+
     if (typeof output === "string") {
       console.log("\n✅ FINAL OUTPUT:", output);
       console.log("No video was generated.");
     } else {
-      const videoOutput = output as { videoPath: string, imagePath: string };
-      
-      if (videoOutput.videoPath) {
-        console.log("\n✅ VIDEO GENERATED: " + videoOutput.videoPath);
-        console.log("✅ IMAGE GENERATED: " + videoOutput.imagePath);
-      } else {
-        console.log("\n✅ IMAGE GENERATED: " + videoOutput.imagePath);
+      const videoOutput = output as { videoPath: string; imagePath: string };
+
+      if (videoOutput.videoPath && videoOutput.imagePath) {
+        console.log("\n✅ VIDEO GENERATED:", videoOutput.videoPath);
+        console.log("✅ IMAGE GENERATED:", videoOutput.imagePath);
+      } else if (videoOutput.imagePath) {
+        console.log("\n✅ IMAGE GENERATED:", videoOutput.imagePath);
         console.log("❌ No video was generated.");
+      } else {
+        console.log("\n❌ No content was generated.");
       }
     }
   } catch (error) {
-    log.error("Error in video creation process", error);
+    console.error("[SCRIPT] Error in video generation:", error);
     process.exit(1);
   }
 }
 
-export { generateVideo, TriageAgent, HypeAgent, AdAgent, CinematicAgent };
-
 if (require.main === module) {
-  main().catch(err => {
+  main().catch((err) => {
     console.error("Fatal error:", err);
     process.exit(1);
   });
